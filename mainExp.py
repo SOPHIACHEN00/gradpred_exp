@@ -60,6 +60,18 @@ parser.add_argument('--trial_id', type=int, default=0, help='Repetition ID')
 parser.add_argument('--use_hessian', action='store_true', help='Enable Hessian fusion')
 parser.add_argument('--lambda_h', type=float, default=0.9, help='Weight for f_P in Eq.(3)')
 
+# adaptive ARIMA options
+parser.add_argument('--arima_err_threshold', type=float, default=5e-3,
+                    help='Adaptive ARIMA reset threshold on EMA prediction error.')
+parser.add_argument('--arima_min_rounds_after_start', type=int, default=2,
+                    help='Minimum observed rounds after ARIMA starts before reset is allowed.')
+parser.add_argument('--arima_retrain_interval', type=int, default=10,
+                    help='Periodic retrain interval for adaptive ARIMA; <=0 disables periodic retraining.')
+parser.add_argument('--arima_err_ema_beta', type=float, default=0.9,
+                    help='EMA smoothing factor for adaptive ARIMA prediction error.')
+parser.add_argument('--arima_trim_history', action=argparse.BooleanOptionalAction, default=True,
+                    help='Trim gradient history after adaptive ARIMA reset.')
+
 
 # lazy mode
 parser.add_argument('--use_lazy', action='store_true', help='Enable Q3 lazy mode: sparse honest rounds, fake otherwise')
@@ -73,9 +85,12 @@ parser.add_argument('--dump_grad_history', action='store_true',
                     help='Dump flattened global gradients each round (clean run, no attacker)')
 parser.add_argument('--dump_dir', type=str, default='data/grad_hist',
                     help='Directory to save gradient CSVs, e.g., data/grad_hist')
+parser.add_argument('--results_root', type=str, default='Results',
+                    help='Root directory for csv outputs, e.g., Results or Results/Dota2_Random_Fedavg')
 
 
 args = parser.parse_args()
+results_root = args.results_root
 
 
 # datasets=("tictactoe" "adult" "dota2")
@@ -445,7 +460,12 @@ if use_attack:
     elif attack_method == "arima_adaptive":
         attacker = AdaptiveARIMAAttack(
             k=K, random_round=WARMUP, model_params=list(model.parameters()),
-            lambda_h=lam, hessian_provider=provider
+            lambda_h=lam, hessian_provider=provider,
+            err_ema_beta=args.arima_err_ema_beta,
+            err_threshold=args.arima_err_threshold,
+            min_rounds_after_start=args.arima_min_rounds_after_start,
+            retrain_interval=args.arima_retrain_interval,
+            trim_history=args.arima_trim_history,
         )
     elif attack_method == "moirai":
         attacker = OfflineMoiraiAttack(
@@ -690,13 +710,17 @@ else:
         contribs_wo = [[]]
         contribs_wo_minmax = [[]]
 
-os.makedirs(f"Results/Contribution_{args.contribution_method}", exist_ok=True)
-os.makedirs(f"Results/Time_{args.contribution_method}", exist_ok=True)
-os.makedirs(f"Results/Accuracy_{args.contribution_method}", exist_ok=True)
+contribution_dir = os.path.join(results_root, f"Contribution_{args.contribution_method}")
+time_dir = os.path.join(results_root, f"Time_{args.contribution_method}")
+accuracy_dir = os.path.join(results_root, f"Accuracy_{args.contribution_method}")
+
+os.makedirs(contribution_dir, exist_ok=True)
+os.makedirs(time_dir, exist_ok=True)
+os.makedirs(accuracy_dir, exist_ok=True)
 
 
 
-with open(f"Results/Contribution_{args.contribution_method}/combined_contributions_trial{trial_id}.csv", "a", newline="") as f:
+with open(os.path.join(contribution_dir, f"combined_contributions_trial{trial_id}.csv"), "a", newline="") as f:
     writer = csv.writer(f)
     if f.tell() == 0:
         writer.writerow([
@@ -733,7 +757,7 @@ with open(f"Results/Contribution_{args.contribution_method}/combined_contributio
         ])
 
 
-with open(f"Results/Time_{args.contribution_method}/attacking_time_log_trial{trial_id}.csv", "a", newline="") as f:
+with open(os.path.join(time_dir, f"attacking_time_log_trial{trial_id}.csv"), "a", newline="") as f:
     writer = csv.writer(f)
     if f.tell() == 0:
         writer.writerow([
@@ -756,7 +780,7 @@ with open(f"Results/Time_{args.contribution_method}/attacking_time_log_trial{tri
 
 
 
-with open(f"Results/Accuracy_{args.contribution_method}/global_accuracy_log_trial{trial_id}.csv", "a", newline="") as f:
+with open(os.path.join(accuracy_dir, f"global_accuracy_log_trial{trial_id}.csv"), "a", newline="") as f:
     writer = csv.writer(f)
 
     if f.tell() == 0:
@@ -783,7 +807,7 @@ with open(f"Results/Accuracy_{args.contribution_method}/global_accuracy_log_tria
         ])
 
 if args.contribution_method == "eds":
-    with open(f"Results/Contribution_{args.contribution_method}/eds_detection_trial{trial_id}.csv", "a", newline="") as f:
+    with open(os.path.join(contribution_dir, f"eds_detection_trial{trial_id}.csv"), "a", newline="") as f:
         writer = csv.writer(f)
         if f.tell() == 0:
             writer.writerow([
