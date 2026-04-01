@@ -1,11 +1,139 @@
 import sys
 sys.path.append("./uni2ts/src")
 
+import json
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from huggingface_hub import hf_hub_download
 from pmdarima import auto_arima
 from uni2ts.model.moirai import MoiraiForecast, MoiraiModule
+from uni2ts.model.moirai.module import decode_distr_output
+
+try:
+    from safetensors.torch import load_file as load_safetensors_file
+except ImportError:  # pragma: no cover - safetensors is expected but keep a fallback
+    load_safetensors_file = None
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _extract_moirai_module_kwargs(raw_config):
+    candidates = [
+        raw_config,
+        raw_config.get("module_kwargs") if isinstance(raw_config, dict) else None,
+        raw_config.get("model_config") if isinstance(raw_config, dict) else None,
+        raw_config.get("module_config") if isinstance(raw_config, dict) else None,
+    ]
+    required = {
+        "distr_output",
+        "d_model",
+        "num_layers",
+        "patch_sizes",
+        "max_seq_len",
+        "attn_dropout_p",
+        "dropout_p",
+    }
+
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        if required.issubset(candidate.keys()):
+            module_kwargs = dict(candidate)
+            if isinstance(module_kwargs.get("distr_output"), dict):
+                module_kwargs["distr_output"] = decode_distr_output(module_kwargs["distr_output"])
+            if isinstance(module_kwargs.get("patch_sizes"), list):
+                module_kwargs["patch_sizes"] = tuple(module_kwargs["patch_sizes"])
+            return module_kwargs
+
+    raise KeyError(f"Could not find MoiraiModule kwargs in config keys: {list(raw_config.keys()) if isinstance(raw_config, dict) else type(raw_config)}")
+
+
+def _resolve_moirai_source(size):
+    local_path = PROJECT_ROOT / f"moirai-1.1-R-{size}"
+    if local_path.exists():
+        print(f"[Moirai][LOAD] using local model path: {local_path}")
+        return str(local_path)
+    return f"Salesforce/moirai-1.1-R-{size}"
+
+
+def _load_moirai_module(repo_or_path):
+    repo_or_path = str(repo_or_path)
+    try:
+        return MoiraiModule.from_pretrained(repo_or_path)
+    except TypeError as exc:
+        # Newer hub/code combinations sometimes fail to hydrate init kwargs for MoiraiModule.
+        msg = str(exc)
+        required_markers = [
+            "distr_output",
+            "d_model",
+            "num_layers",
+            "patch_sizes",
+            "max_seq_len",
+            "attn_dropout_p",
+            "dropout_p",
+        ]
+        if not all(marker in msg for marker in required_markers):
+            raise
+
+        print(f"[Moirai][LOAD] direct from_pretrained failed for {repo_or_path}; trying manual config+weights fallback")
+
+        if Path(repo_or_path).exists():
+            config_path = Path(repo_or_path) / "config.json"
+            if not config_path.exists():
+                raise FileNotFoundError(f"Missing config.json under local Moirai path: {repo_or_path}")
+
+            with open(config_path, "r", encoding="utf-8") as f:
+                raw_config = json.load(f)
+            module_kwargs = _extract_moirai_module_kwargs(raw_config)
+            module = MoiraiModule(**module_kwargs)
+
+            safetensor_path = Path(repo_or_path) / "model.safetensors"
+            pytorch_bin_path = Path(repo_or_path) / "pytorch_model.bin"
+
+            if safetensor_path.exists():
+                if load_safetensors_file is None:
+                    raise ImportError("safetensors is not available but model.safetensors is present")
+                state_dict = load_safetensors_file(str(safetensor_path), device="cpu")
+            elif pytorch_bin_path.exists():
+                state_dict = torch.load(str(pytorch_bin_path), map_location="cpu")
+            else:
+                raise FileNotFoundError(
+                    f"Neither model.safetensors nor pytorch_model.bin found under {repo_or_path}"
+                )
+
+            module.load_state_dict(state_dict, strict=True)
+            return module
+
+        config_path = hf_hub_download(repo_or_path, "config.json")
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+        module_kwargs = _extract_moirai_module_kwargs(raw_config)
+        module = MoiraiModule(**module_kwargs)
+
+        state_dict = None
+        safetensor_error = None
+        try:
+            weight_path = hf_hub_download(repo_or_path, "model.safetensors")
+            if load_safetensors_file is None:
+                raise ImportError("safetensors is not available")
+            state_dict = load_safetensors_file(weight_path, device="cpu")
+        except Exception as inner_exc:
+            safetensor_error = inner_exc
+
+        if state_dict is None:
+            try:
+                weight_path = hf_hub_download(repo_or_path, "pytorch_model.bin")
+                state_dict = torch.load(weight_path, map_location="cpu")
+            except Exception:
+                raise RuntimeError(
+                    f"Failed to load Moirai weights for {repo_or_path} via both safetensors and pytorch_model.bin"
+                ) from safetensor_error
+
+        module.load_state_dict(state_dict, strict=True)
+        return module
 
 
 def _avg_history_np(history, k):
@@ -375,12 +503,8 @@ class AdaptiveARIMAAttack:
             self._reset_arima_state()
 
     def get_fake_gradient(self, round_num, device, model):
-        if len(self.global_gradient_history) < self.k:
-            _log_fallback("ARIMA][ADAPT", round_num, "random", "insufficient_history", extra=f"history={len(self.global_gradient_history)}")
-            return [torch.randn_like(p, device=device) for p in model.parameters()]
-
-        if round_num < self.random_round:
-            _log_fallback("ARIMA][ADAPT", round_num, "random", "warmup")
+        if len(self.global_gradient_history) == 0:
+            _log_fallback("ARIMA][ADAPT", round_num, "random", "no_history")
             return [torch.randn_like(p, device=device) for p in model.parameters()]
 
         if (not self.arima_started) and self.check_arima_ready():
@@ -415,6 +539,10 @@ class AdaptiveARIMAAttack:
             self._last_pred_round = int(round_num)
             self._last_pred_flat = torch.cat([g.reshape(-1).detach().cpu() for g in predicted_gradient]).numpy().astype(np.float32)
             return self._hessian_fuse(predicted_gradient, model, device)
+
+        if round_num < self.random_round:
+            _log_fallback("ARIMA][ADAPT", round_num, "avg", "warmup", extra=f"used={min(len(self.global_gradient_history), self.k)}")
+            return self._avg_fallback(device, model)
 
         _log_fallback("ARIMA][ADAPT", round_num, "avg", "not_ready", extra=f"used={min(len(self.global_gradient_history), self.k)}")
         return self._avg_fallback(device, model)
@@ -456,7 +584,7 @@ class OfflineMoiraiAttack:
         self.param_sizes = [p.numel() for p in model.parameters()]
         self.D = int(sum(self.param_sizes))
         self.model = MoiraiForecast(
-            module=MoiraiModule.from_pretrained(f"Salesforce/moirai-1.1-R-{self.size}"),
+            module=_load_moirai_module(_resolve_moirai_source(self.size)),
             prediction_length=1,
             context_length=self.history_length,
             patch_size=self.patch_size,
@@ -564,7 +692,7 @@ class OnlineMoiraiAttack:
         self.param_sizes = [p.numel() for p in model.parameters()]
         self.D = int(sum(self.param_sizes))
         self.model = MoiraiForecast(
-            module=MoiraiModule.from_pretrained(f"Salesforce/moirai-1.1-R-{self.size}"),
+            module=_load_moirai_module(_resolve_moirai_source(self.size)),
             prediction_length=1,
             context_length=self.history_length,
             patch_size=self.patch_size,
@@ -584,7 +712,7 @@ class OnlineMoiraiAttack:
         self.param_sizes = [g.numel() for g in global_gradient]
         self.D = int(sum(self.param_sizes))
         self.model = MoiraiForecast(
-            module=MoiraiModule.from_pretrained(f"Salesforce/moirai-1.1-R-{self.size}"),
+            module=_load_moirai_module(_resolve_moirai_source(self.size)),
             prediction_length=1,
             context_length=self.history_length,
             patch_size=self.patch_size,
